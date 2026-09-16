@@ -78,6 +78,16 @@ def run_scraping() -> dict:
                     .first()
                 )
                 if existing:
+                    existing.title = item["title"]
+                    existing.description = item["description"]
+                    existing.raw_text = item["raw_text"]
+                    existing.severity = item["severity"]
+                    existing.status_type = item["status_type"]
+                    existing.valid_from = parse_date(item["valid_from"])
+                    existing.valid_to = parse_date(item["valid_to"])
+                    existing.is_active = item["is_active"]
+                    existing.scraped_at = datetime.fromisoformat(item["scraped_at"])
+                    db.commit()
                     skipped_count += 1
                     continue
 
