@@ -1,25 +1,74 @@
-from fastapi import FastAPI, Depends, Query
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from apscheduler.schedulers.background import BackgroundScheduler
+
+from config import CORS_ORIGINS, SCRAPE_INTERVAL_MINUTES, SCRAPE_ON_STARTUP
+from database import SessionLocal
+from logging_setup import configure_logging
+from models import RoadReport
 from scraper_job import run_scraping
 
-from database import SessionLocal
-from models import RoadReport
-
-app = FastAPI(title="AMSM Road Conditions API")
+configure_logging()
+logger = logging.getLogger("roadmk.main")
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(run_scraping, 'interval', minutes=30)
-scheduler.start()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Wiring the scheduler up inside the FastAPI lifespan (instead of at
+    # module import time) means:
+    #  - it is guaranteed to start exactly once, when the app actually
+    #    starts serving, and to log that fact;
+    #  - it shuts down cleanly with the app instead of leaking a
+    #    background thread.
+    kwargs = {}
+    if SCRAPE_ON_STARTUP:
+        # Run once immediately, then every SCRAPE_INTERVAL_MINUTES.
+        # Without this, the job only fires for the first time after a
+        # full interval has elapsed -- with zero output in the meantime,
+        # which is what made the scheduler look broken.
+        kwargs["next_run_time"] = datetime.now()
+
+    scheduler.add_job(
+        run_scraping,
+        "interval",
+        minutes=SCRAPE_INTERVAL_MINUTES,
+        id="amsm_scraping_job",
+        replace_existing=True,
+        **kwargs,
+    )
+    scheduler.start()
+    logger.info(
+        "Scheduler started: running scraping every %d minute(s) (run on startup: %s)",
+        SCRAPE_INTERVAL_MINUTES,
+        SCRAPE_ON_STARTUP,
+    )
+
+    yield
+
+    logger.info("Shutting down scheduler")
+    scheduler.shutdown(wait=False)
+
+
+app = FastAPI(title="AMSM Road Conditions API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    # allow_credentials=True together with allow_origins=["*"] is invalid
+    # per the CORS spec (browsers will reject it) and this API doesn't use
+    # cookies/auth, so there is nothing that needs credentialed requests.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 def get_db():
     db = SessionLocal()
@@ -27,6 +76,7 @@ def get_db():
         yield db
     finally:
         db.close()
+
 
 def report_to_dict(report: RoadReport):
     return {
@@ -45,9 +95,11 @@ def report_to_dict(report: RoadReport):
         "source_url": report.source_url,
     }
 
+
 @app.get("/")
 def root():
     return {"message": "AMSM API is running"}
+
 
 @app.get("/reports")
 def get_reports(
@@ -72,12 +124,14 @@ def get_reports(
     reports = sorted(reports, key=lambda r: (priority.get(r.severity, 99), r.id))
     return [report_to_dict(report) for report in reports]
 
+
 @app.get("/reports/{report_id}")
 def get_report(report_id: int, db: Session = Depends(get_db)):
     report = db.query(RoadReport).filter(RoadReport.id == report_id).first()
     if not report:
-        return {"error": "Report not found"}
+        raise HTTPException(status_code=404, detail="Report not found")
     return report_to_dict(report)
+
 
 @app.get("/summary")
 def get_summary(db: Session = Depends(get_db)):
@@ -88,3 +142,15 @@ def get_summary(db: Session = Depends(get_db)):
     green = len([r for r in reports if r.severity == "GREEN"])
     active = len([r for r in reports if r.is_active])
     return {"total": total, "active": active, "red": red, "yellow": yellow, "green": green}
+
+
+@app.post("/scrape-now")
+def scrape_now():
+    """
+    Manually trigger a scraping run on demand, outside of the schedule.
+    Useful to confirm the scraping logic itself works, and to test the
+    scheduler wiring by comparing its logs against this endpoint's logs.
+    """
+    logger.info("Manual scraping run triggered via /scrape-now")
+    result = run_scraping()
+    return result

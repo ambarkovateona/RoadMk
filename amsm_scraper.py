@@ -1,21 +1,52 @@
-import json
 import hashlib
+import json
+import logging
 import re
-from datetime import datetime, timezone, date
+import time
+from datetime import date, datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup
 
-URL = "https://amsm.mk/sostojba-na-patishta/dnevni-informacii/"
+from config import (
+    REQUEST_MAX_RETRIES,
+    REQUEST_RETRY_BACKOFF_SECONDS,
+    REQUEST_TIMEOUT_SECONDS,
+    SCRAPE_URL,
+)
+
+logger = logging.getLogger("roadmk.scraper")
+
+# Kept as an alias so existing imports of `URL` keep working.
+URL = SCRAPE_URL
 
 
 def fetch_html(url: str) -> str:
+    """
+    Fetch a page with a couple of retries. AMSM occasionally times out or
+    briefly returns 5xx -- without a retry, a single bad request used to
+    mean the whole scheduled run silently produced nothing until the next
+    interval fired.
+    """
     headers = {
         "User-Agent": "RoadScraper/1.0 (student project)"
     }
-    response = requests.get(url, headers=headers, timeout=20)
-    response.raise_for_status()
-    return response.text
+
+    last_error: Exception | None = None
+    for attempt in range(1, REQUEST_MAX_RETRIES + 1):
+        try:
+            logger.info("Fetching %s (attempt %d/%d)", url, attempt, REQUEST_MAX_RETRIES)
+            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            return response.text
+        except requests.RequestException as e:
+            last_error = e
+            logger.warning("Fetch attempt %d/%d failed: %s", attempt, REQUEST_MAX_RETRIES, e)
+            if attempt < REQUEST_MAX_RETRIES:
+                time.sleep(REQUEST_RETRY_BACKOFF_SECONDS * attempt)
+
+    assert last_error is not None
+    raise last_error
 
 
 def clean_text(s: str) -> str:
@@ -290,14 +321,36 @@ def deduplicate_items(items: list[dict]) -> list[dict]:
 def parse_page(html: str, source_url: str) -> dict:
     soup = BeautifulSoup(html, "html.parser")
     article = soup.find("article") or soup
+    if article is soup:
+        logger.warning(
+            "No <article> tag found on the page; falling back to parsing the "
+            "whole document. This usually means AMSM changed the page layout."
+        )
     scraped_at = datetime.now(timezone.utc).isoformat()
 
     items = []
-    items.extend(parse_general_sections(article, scraped_at, source_url))
-    items.extend(parse_road_works(article, scraped_at, source_url))
-    items.extend(parse_section_blocks(article, scraped_at, source_url))
+    for parser_name, parser_fn in (
+        ("general_sections", parse_general_sections),
+        ("road_works", parse_road_works),
+        ("section_blocks", parse_section_blocks),
+    ):
+        try:
+            found = parser_fn(article, scraped_at, source_url)
+            logger.info("%s: found %d item(s)", parser_name, len(found))
+            items.extend(found)
+        except Exception:
+            # One parsing strategy failing (e.g. AMSM tweaked markup for
+            # just one section) should not take the other two down with it.
+            logger.exception("Parser '%s' raised an exception, skipping it", parser_name)
 
     items = deduplicate_items(items)
+
+    if not items:
+        logger.warning(
+            "Parsed 0 items from %s. The page structure may have changed, "
+            "or there genuinely are no active notices right now.",
+            source_url,
+        )
 
     return {
         "source": source_url,
