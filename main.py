@@ -21,18 +21,8 @@ scheduler = BackgroundScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Wiring the scheduler up inside the FastAPI lifespan (instead of at
-    # module import time) means:
-    #  - it is guaranteed to start exactly once, when the app actually
-    #    starts serving, and to log that fact;
-    #  - it shuts down cleanly with the app instead of leaking a
-    #    background thread.
     kwargs = {}
     if SCRAPE_ON_STARTUP:
-        # Run once immediately, then every SCRAPE_INTERVAL_MINUTES.
-        # Without this, the job only fires for the first time after a
-        # full interval has elapsed -- with zero output in the meantime,
-        # which is what made the scheduler look broken.
         kwargs["next_run_time"] = datetime.now()
 
     scheduler.add_job(
@@ -61,9 +51,6 @@ app = FastAPI(title="AMSM Road Conditions API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    # allow_credentials=True together with allow_origins=["*"] is invalid
-    # per the CORS spec (browsers will reject it) and this API doesn't use
-    # cookies/auth, so there is nothing that needs credentialed requests.
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -146,11 +133,23 @@ def get_summary(db: Session = Depends(get_db)):
 
 @app.post("/scrape-now")
 def scrape_now():
-    """
-    Manually trigger a scraping run on demand, outside of the schedule.
-    Useful to confirm the scraping logic itself works, and to test the
-    scheduler wiring by comparing its logs against this endpoint's logs.
-    """
     logger.info("Manual scraping run triggered via /scrape-now")
     result = run_scraping()
     return result
+
+
+@app.delete("/reports/{report_id}")
+def delete_report(report_id: int, db: Session = Depends(get_db)):
+    report = db.query(RoadReport).filter(RoadReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    db.delete(report)
+    db.commit()
+    return {"deleted": report_id}
+
+
+@app.delete("/reports")
+def delete_all_reports(db: Session = Depends(get_db)):
+    db.query(RoadReport).delete()
+    db.commit()
+    return {"deleted": "all"}
