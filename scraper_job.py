@@ -32,21 +32,6 @@ def _build_report(item: dict) -> RoadReport:
 
 
 def run_scraping() -> dict:
-    """
-    Fetch the AMSM page, parse it and store any new reports.
-
-    Returns a small summary dict (used by tests, and available to any
-    caller that wants to know what happened -- e.g. a manual trigger
-    endpoint).
-
-    IMPORTANT: each item is committed individually. Previously the whole
-    batch was built and committed in a single try/except block, so if a
-    single item raised an exception (bad date, unexpected None field,
-    etc.) the except-branch rolled back the *entire* session -- discarding
-    every other item that had already been added in that run. That made
-    the scheduler look like it "wasn't doing anything": it ran, it fetched
-    data, but one malformed entry silently wiped out the whole run.
-    """
     logger.info("Scraping run started (source=%s)", URL)
 
     try:
@@ -96,8 +81,6 @@ def run_scraping() -> dict:
                 db.commit()
                 new_count += 1
             except Exception:
-                # Roll back only this item, log it, and keep going --
-                # one bad entry no longer takes the rest of the run with it.
                 db.rollback()
                 error_count += 1
                 logger.exception(
@@ -106,6 +89,21 @@ def run_scraping() -> dict:
                 )
     finally:
         db.close()
+
+    # Brisanje na zapisi koi poveke ne se na AMSM stranacata
+    scraped_ids = [item["id"] for item in items]
+    db2 = SessionLocal()
+    try:
+        deleted = db2.query(RoadReport).filter(
+            RoadReport.external_id.notin_(scraped_ids)
+        ).delete(synchronize_session=False)
+        db2.commit()
+        logger.info("Deleted %d stale report(s) no longer on the AMSM page", deleted)
+    except Exception:
+        db2.rollback()
+        logger.exception("Failed to delete stale reports")
+    finally:
+        db2.close()
 
     logger.info(
         "Scraping run finished: %d new, %d already existed, %d failed (out of %d parsed)",
