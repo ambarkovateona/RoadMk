@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.idea/
+node_modules/
+roadmk-frontend/dist/
+.env.example

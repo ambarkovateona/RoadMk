@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: postgres:16
+    platform: linux/arm64
+    container_name: amsm_postgres_new
+    restart: always
+    environment:
+      POSTGRES_DB: amsm_db
+      POSTGRES_USER: amsm_user
+      POSTGRES_PASSWORD: amsm_pass
+    ports:
+      - "5434:5432"
+    volumes:
+      - amsm_postgres_data_new:/var/lib/postgresql/data
+
+volumes:
+  amsm_postgres_data_new:
